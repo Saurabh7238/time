@@ -2,10 +2,11 @@ import { createContext, useContext, useEffect, useState, useCallback, useRef, ty
 import type { Task, Settings, ScreenDay } from '@/types';
 import { DEFAULT_SETTINGS } from '@/types';
 import { getAllTasks, putTask, deleteTask, getAllScreenDays, loadSettings, saveSettings, getScreenDay, putScreenDay, todayStr, uid } from '@/lib/db';
-import { triggerAlarm, snoozeTask, completeTask, requestNotificationPermission } from '@/lib/alarm';
+import { triggerAlarm, snoozeTask, completeTask, requestNotificationPermission, unlockAlarmAudio, stopAlarmSound } from '@/lib/alarm';
 import { initTracker, updateSettings, setCurrentUrl } from '@/lib/tracker';
 import { t, type Lang } from '@/lib/i18n';
 import { randomQuote } from '@/lib/utils';
+import { deleteSyncedReminder, disablePushNotifications, isPushConfigured, setupPushNotifications, syncTaskReminder, syncTaskReminders } from '@/lib/push';
 
 interface Toast {
   id: string;
@@ -76,15 +77,28 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (s.theme === 'dark') document.documentElement.classList.add('dark');
       const ts = await getAllTasks();
       setTasks(ts.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time)));
+      if (s.notificationsEnabled && isPushConfigured() && 'Notification' in window && Notification.permission === 'granted') {
+        void setupPushNotifications().then(result => {
+          if (result.ok) void syncTaskReminders(ts);
+        });
+      }
       const sd = await getAllScreenDays();
       setScreenDays(sd);
-      if (s.notificationsEnabled) requestNotificationPermission();
       initTracker(s, {
         onWarning80: () => addToast(T('warning80'), 'warning'),
         onBlock: () => setBlock({ active: true, quote: randomQuote() }),
       });
     })();
   }, []); // eslint-disable-line
+
+  useEffect(() => {
+    const unlock = () => {
+      void unlockAlarmAudio();
+      window.removeEventListener('pointerdown', unlock);
+    };
+    window.addEventListener('pointerdown', unlock, { once: true });
+    return () => window.removeEventListener('pointerdown', unlock);
+  }, []);
 
   // Alarm checker
   useEffect(() => {
@@ -137,38 +151,86 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const addTask = useCallback(async (task: Omit<Task, 'id' | 'done' | 'createdAt'>) => {
     const newTask: Task = { ...task, id: uid(), done: false, createdAt: Date.now() };
     await putTask(newTask);
+    if (settings.notificationsEnabled) void syncTaskReminder(newTask);
     setTasks(prev => [...prev, newTask].sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time)));
     addToast(T('save') + ' ✓', 'success');
-  }, [addToast, T]);
+  }, [addToast, T, settings.notificationsEnabled]);
 
   const updateTask = useCallback(async (task: Task) => {
     await putTask(task);
+    if (settings.notificationsEnabled) void syncTaskReminder(task);
     setTasks(prev => prev.map(t => t.id === task.id ? task : t).sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time)));
-  }, []);
+  }, [settings.notificationsEnabled]);
 
   const removeTask = useCallback(async (id: string) => {
     await deleteTask(id);
+    void deleteSyncedReminder(id);
     setTasks(prev => prev.filter(t => t.id !== id));
   }, []);
 
   const toggleDone = useCallback(async (task: Task) => {
     const updated = { ...task, done: !task.done };
     await putTask(updated);
+    if (settings.notificationsEnabled) void syncTaskReminder(updated);
     setTasks(prev => prev.map(t => t.id === task.id ? updated : t));
-  }, []);
+  }, [settings.notificationsEnabled]);
 
   const snooze = useCallback(async (task: Task, min: number) => {
     const updated = await snoozeTask(task, min);
+    if (settings.notificationsEnabled) void syncTaskReminder(updated);
     setTasks(prev => prev.map(t => t.id === task.id ? updated : t));
+    stopAlarmSound();
     setAlarmTask(null);
     addToast(`${T('snoozed')} ${min} ${T('minutes')}`, 'info');
-  }, [addToast, T]);
+  }, [addToast, T, settings.notificationsEnabled]);
 
-  const dismissAlarm = useCallback(() => setAlarmTask(null), []);
-
-  const updateSettingsFn = useCallback((s: Partial<Settings>) => {
-    setSettings(prev => ({ ...prev, ...s }));
+  const dismissAlarm = useCallback(() => {
+    stopAlarmSound();
+    setAlarmTask(null);
   }, []);
+
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    const handleMessage = (event: MessageEvent) => {
+      const message = event.data as { type?: string; taskId?: string; action?: string; minutes?: number };
+      if (message.type !== 'alarm-action' || !message.taskId) return;
+      const task = tasks.find(item => item.id === message.taskId);
+      if (!task) return;
+      if (message.action === 'snooze' && message.minutes) {
+        void snooze(task, message.minutes);
+      } else if (message.action === 'done') {
+        void toggleDone(task).then(() => {
+          stopAlarmSound();
+          setAlarmTask(current => current?.id === task.id ? null : current);
+        });
+      }
+    };
+    navigator.serviceWorker.addEventListener('message', handleMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', handleMessage);
+  }, [tasks, snooze, toggleDone]);
+
+  const updateSettingsFn = useCallback(async (s: Partial<Settings>) => {
+    if (s.notificationsEnabled) {
+      const granted = await requestNotificationPermission();
+      if (!granted) {
+        setSettings(prev => ({ ...prev, notificationsEnabled: false }));
+        addToast(T('notificationPermissionNeeded'), 'warning');
+        return;
+      }
+    }
+    setSettings(prev => ({ ...prev, ...s }));
+    if (s.notificationsEnabled === false) {
+      void disablePushNotifications();
+    } else if (s.notificationsEnabled === true) {
+      if (!isPushConfigured()) {
+        addToast(T('pushBackendNotConfigured'), 'warning');
+      } else {
+        const result = await setupPushNotifications();
+        if (result.ok) await syncTaskReminders(tasks);
+        else if (result.reason) addToast(T(result.reason), 'warning');
+      }
+    }
+  }, [addToast, T, tasks]);
 
   const toggleTheme = useCallback(() => {
     setSettings(prev => ({ ...prev, theme: prev.theme === 'light' ? 'dark' : 'light' }));

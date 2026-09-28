@@ -11,6 +11,10 @@ function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
 
 export function SettingsView() {
   const { settings, T, toggleTheme, toggleLang, toggleFocus, updateSettings } = useStore();
+  const toggleNotifications = () => {
+    const permissionGranted = typeof Notification !== 'undefined' && Notification.permission === 'granted';
+    updateSettings({ notificationsEnabled: !settings.notificationsEnabled || !permissionGranted });
+  };
 
   return (
     <div className="mx-auto max-w-2xl space-y-6">
@@ -56,7 +60,7 @@ export function SettingsView() {
           <Row icon={Volume2} label={T('sound')} on={settings.soundEnabled} onClick={() => updateSettings({ soundEnabled: !settings.soundEnabled })} />
           <Row icon={Eye} label={T('voice')} on={settings.voiceEnabled} onClick={() => updateSettings({ voiceEnabled: !settings.voiceEnabled })} />
           <Row icon={Vibrate} label={T('vibration')} on={settings.vibrationEnabled} onClick={() => updateSettings({ vibrationEnabled: !settings.vibrationEnabled })} />
-          <Row icon={Bell} label={T('notifications')} on={settings.notificationsEnabled} onClick={() => updateSettings({ notificationsEnabled: !settings.notificationsEnabled })} />
+          <Row icon={Bell} label={T('notifications')} on={settings.notificationsEnabled} onClick={toggleNotifications} />
         </div>
       </div>
 

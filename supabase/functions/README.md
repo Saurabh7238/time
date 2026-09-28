@@ -1,0 +1,1 @@
+The `send-due-alarms` Edge Function is invoked by the `focusguard-send-due-reminders` Supabase Cron job. Follow [the setup guide](../README.md) to configure secrets, deploy the function, and enable scheduled delivery.
